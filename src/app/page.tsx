@@ -20,6 +20,8 @@ type Report = {
   criticalCount: number;
   warningCount: number;
   infoCount: number;
+  projectLicense?: string;
+  topLicenses?: Array<{license: string; count: number}>;
   results: Array<{name:string;version:string;license?:string;latest?:string;issues:{level:string;kind:string;msg:string;fix?:string}[]}> 
 };
 
@@ -356,6 +358,31 @@ export default function AnalyzePage() {
                     <Copy className="h-4 w-4 mr-2" />
                     Copy All Fixes
                   </Button>
+                )}
+
+                {/* License Summary */}
+                {report.projectLicense && report.topLicenses && report.topLicenses.length > 0 && (
+                  <Card className="mb-4">
+                    <CardHeader>
+                      <CardTitle className="text-sm">
+                        📜 License Summary (Project: {report.projectLicense})
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        {report.topLicenses.slice(0, 6).map((item, idx) => (
+                          <div key={idx} className="flex justify-between">
+                            <span className="truncate" title={item.license}>
+                              {item.license}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {item.count}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </CardContent>
+                  </Card>
                 )}
 
                 {/* Package List with Inline Status */}

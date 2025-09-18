@@ -62,10 +62,24 @@ async function fetchWithTimeout(url: string, timeoutMs = 5000, headers?: Record<
 
 // Extract only needed fields from version metadata - don't store the whole response
 function extractVersionInfo(versionMeta: any, name: string, version: string) {
+  // Normalize license information
+  let license = versionMeta?.license || "UNKNOWN";
+  
+  // Handle complex license objects
+  if (typeof license === 'object') {
+    if (license.type) {
+      license = license.type;
+    } else if (Array.isArray(license)) {
+      license = license.map(l => l.type || l).join(", ");
+    } else {
+      license = JSON.stringify(license);
+    }
+  }
+  
   return {
     name,
     version,
-    license: versionMeta?.license || "UNKNOWN",
+    license: license || "UNKNOWN",
     deprecated: !!versionMeta?.deprecated,
     scripts: {
       preinstall: !!versionMeta?.scripts?.preinstall,
@@ -73,6 +87,45 @@ function extractVersionInfo(versionMeta: any, name: string, version: string) {
       install: !!versionMeta?.scripts?.install
     }
   };
+}
+
+// Check for license conflicts
+function checkLicenseConflict(projectLicense: string, packageLicense: string): { hasConflict: boolean; severity: "warning" | "info"; reason: string } | null {
+  if (!projectLicense || !packageLicense || packageLicense === "UNKNOWN") {
+    return null;
+  }
+
+  const project = projectLicense.toUpperCase();
+  const pkg = packageLicense.toUpperCase();
+
+  // High severity conflicts
+  if (project.includes("MIT") || project.includes("BSD") || project.includes("APACHE")) {
+    if (pkg.includes("GPL") && !pkg.includes("LGPL")) {
+      return {
+        hasConflict: true,
+        severity: "warning",
+        reason: `${packageLicense} requires derivatives to be open source, conflicts with ${projectLicense}`
+      };
+    }
+    if (pkg.includes("AGPL")) {
+      return {
+        hasConflict: true,
+        severity: "warning", 
+        reason: `${packageLicense} requires network use to trigger copyleft, conflicts with ${projectLicense}`
+      };
+    }
+  }
+
+  // Medium severity - worth noting
+  if (project.includes("MIT") && pkg.includes("LGPL")) {
+    return {
+      hasConflict: false,
+      severity: "info",
+      reason: `${packageLicense} is compatible but may require attribution/distribution of LGPL portions`
+    };
+  }
+
+  return null;
 }
 
 // Helper function to process items with concurrency limit
@@ -215,13 +268,16 @@ export const analyzePackages = action({
         }
       }
 
-      // License risk
-      if (projectLicense?.toUpperCase().includes("MIT") && res.license && /AGPL|GPL-3/i.test(res.license)) {
-        res.issues.push({ 
-          level: "warning", 
-          kind: "license", 
-          msg: `License conflict (${res.license})` 
-        });
+      // Enhanced license conflict checking
+      if (projectLicense && res.license) {
+        const conflict = checkLicenseConflict(projectLicense, res.license);
+        if (conflict) {
+          res.issues.push({ 
+            level: conflict.severity, 
+            kind: "license", 
+            msg: conflict.reason
+          });
+        }
       }
 
       // Known vulnerabilities
@@ -301,6 +357,19 @@ export const analyzePackages = action({
       score = "A";
     }
 
+    // Generate license summary
+    const licenseSummary = new Map<string, number>();
+    for (const result of results) {
+      if (result.license && result.license !== "UNKNOWN") {
+        licenseSummary.set(result.license, (licenseSummary.get(result.license) || 0) + 1);
+      }
+    }
+    
+    const topLicenses = Array.from(licenseSummary.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([license, count]) => ({ license, count }));
+
     return { 
       score, 
       count: results.length, 
@@ -309,6 +378,8 @@ export const analyzePackages = action({
       criticalCount,
       warningCount,
       infoCount,
+      projectLicense,
+      topLicenses,
       results 
     };
   },
