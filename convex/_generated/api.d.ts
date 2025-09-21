@@ -14,6 +14,7 @@ import type {
   FunctionReference,
 } from "convex/server";
 import type * as analyze from "../analyze.js";
+import type * as sponsors from "../sponsors.js";
 
 /**
  * A utility for referencing Convex functions in your app's API.
@@ -25,6 +26,7 @@ import type * as analyze from "../analyze.js";
  */
 declare const fullApi: ApiFromModules<{
   analyze: typeof analyze;
+  sponsors: typeof sponsors;
 }>;
 export declare const api: FilterApi<
   typeof fullApi,
