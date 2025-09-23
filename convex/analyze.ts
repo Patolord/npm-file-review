@@ -1,12 +1,159 @@
-import { action } from "./_generated/server";
 import { v } from "convex/values";
+import { action } from "./_generated/server";
 // @ts-ignore - semver package exists but types may not be fully resolved in Convex environment
 import semver from "semver";
 
 type Issue = { level: "critical" | "warning" | "info"; kind: string; msg: string; fix?: string };
 type Result = { name: string; version: string; requested?: string; license?: string; latest?: string; issues: Issue[] };
 
-const knownVulns: Record<string, { range: string; fix: string; msg: string }[]> = {
+// OSV (Open Source Vulnerabilities) API integration
+type OSVVulnerability = {
+  id: string;
+  summary: string;
+  details?: string;
+  aliases?: string[];
+  affected: Array<{
+    package: {
+      ecosystem: string;
+      name: string;
+    };
+    ranges: Array<{
+      type: string;
+      events: Array<{
+        introduced?: string;
+        fixed?: string;
+      }>;
+    }>;
+    versions?: string[];
+  }>;
+  severity?: Array<{
+    type: string;
+    score: string;
+  }>;
+  references?: Array<{
+    type: string;
+    url: string;
+  }>;
+  database_specific?: {
+    severity?: string;
+    cvss?: any;
+  };
+};
+
+type OSVQueryResponse = {
+  vulns: OSVVulnerability[];
+};
+
+// Query OSV API for vulnerabilities (batch processing)
+async function queryOSVVulnerabilitiesBatch(packages: Array<{name: string, version: string}>): Promise<Map<string, OSVVulnerability[]>> {
+  const results = new Map<string, OSVVulnerability[]>();
+  
+  // Process in smaller batches to avoid overwhelming the API
+  const BATCH_SIZE = 10;
+  
+  for (let i = 0; i < packages.length; i += BATCH_SIZE) {
+    const batch = packages.slice(i, i + BATCH_SIZE);
+    
+    // Use OSV's batch query endpoint
+    try {
+      const queries = batch.map(pkg => ({
+        package: {
+          name: pkg.name,
+          ecosystem: "npm"
+        },
+        version: pkg.version
+      }));
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+      const response = await fetch("https://api.osv.dev/v1/querybatch", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ queries }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const batchResults = await response.json() as { results: OSVQueryResponse[] };
+        
+        // Map results back to packages
+        batchResults.results.forEach((result, index) => {
+          if (index < batch.length) {
+            const pkg = batch[index];
+            const key = `${pkg.name}@${pkg.version}`;
+            results.set(key, result.vulns || []);
+          }
+        });
+      }
+    } catch (error) {
+      console.warn(`Failed to query OSV batch:`, error);
+      // Set empty results for this batch
+      for (const pkg of batch) {
+        const key = `${pkg.name}@${pkg.version}`;
+        results.set(key, []);
+      }
+    }
+    
+    // Small delay between batches to be respectful to the API
+    if (i + BATCH_SIZE < packages.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  
+  return results;
+}
+
+// Convert OSV vulnerability to our Issue format
+function osvToIssue(vuln: OSVVulnerability, packageName: string): Issue {
+  // Get CVE ID if available
+  const cveId = vuln.aliases?.find(alias => alias.startsWith('CVE-')) || vuln.id;
+  
+  // Get severity level
+  let level: "critical" | "warning" | "info" = "warning";
+  if (vuln.severity?.length) {
+    const severity = vuln.severity[0];
+    if (severity.type === "CVSS_V3" && severity.score) {
+      const score = parseFloat(severity.score);
+      if (score >= 9.0) level = "critical";
+      else if (score >= 7.0) level = "critical";
+      else if (score >= 4.0) level = "warning";
+      else level = "info";
+    }
+  } else if (vuln.database_specific?.severity) {
+    const severity = vuln.database_specific.severity.toLowerCase();
+    if (severity.includes("critical") || severity.includes("high")) level = "critical";
+    else if (severity.includes("medium")) level = "warning";
+    else level = "info";
+  }
+
+  // Get fixed version if available
+  let fix: string | undefined;
+  const affected = vuln.affected?.find(a => a.package.name === packageName);
+  if (affected?.ranges) {
+    for (const range of affected.ranges) {
+      const fixedEvent = range.events.find(e => e.fixed);
+      if (fixedEvent?.fixed) {
+        fix = `${packageName}@${fixedEvent.fixed}`;
+        break;
+      }
+    }
+  }
+
+  return {
+    level,
+    kind: "vuln",
+    msg: `${cveId}: ${vuln.summary.substring(0, 80)}${vuln.summary.length > 80 ? '...' : ''}`,
+    fix
+  };
+}
+
+// Fallback known vulnerabilities (for when OSV API is unavailable)
+const fallbackVulns: Record<string, { range: string; fix: string; msg: string }[]> = {
   minimist: [{ range: "<1.2.6", fix: "1.2.8", msg: "Prototype pollution (CVE-2020-7598). Upgrade recommended." }],
   tar: [{ range: "<4.4.19", fix: "4.4.19", msg: "Path traversal vulnerability (CVE-2021-32804). Upgrade recommended." }],
   "ua-parser-js": [{ range: "<0.7.24", fix: "0.7.24", msg: "Regular Expression Denial of Service (CVE-2020-36313). Upgrade recommended." }],
@@ -224,6 +371,22 @@ export const analyzePackages = action({
       versionInfoMap.set(`${info.name}@${info.version}`, info);
     }
 
+    // Batch query OSV API for vulnerabilities
+    let osvVulnMap = new Map<string, OSVVulnerability[]>();
+    let vulnSource = "fallback";
+    try {
+      console.log(`Querying OSV API for vulnerabilities of ${depsToAnalyze.length} packages...`);
+      osvVulnMap = await queryOSVVulnerabilitiesBatch(depsToAnalyze);
+      vulnSource = "osv";
+      console.log(`OSV API returned vulnerability data for ${osvVulnMap.size} packages`);
+      
+      // Count packages with vulnerabilities
+      const vulnCount = Array.from(osvVulnMap.values()).reduce((sum, vulns) => sum + vulns.length, 0);
+      console.log(`Found ${vulnCount} total vulnerabilities across all packages`);
+    } catch (error) {
+      console.warn("Failed to query OSV API for vulnerabilities, falling back to hardcoded data:", error);
+    }
+
     const results: Result[] = [];
 
     for (const d of depsToAnalyze) {
@@ -280,18 +443,30 @@ export const analyzePackages = action({
         }
       }
 
-      // Known vulnerabilities
-      const seeds = knownVulns[d.name] ?? [];
-      for (const ventry of seeds) {
-        if (semver.satisfies(d.version, ventry.range)) {
-          res.issues.push({ 
-            level: "critical", 
-            kind: "vuln", 
-            msg: ventry.msg.substring(0, 100), // Keep messages short
-            fix: `${d.name}@${ventry.fix}` 
-          });
+      // Check vulnerabilities from OSV API (with fallback)
+      const packageKey = `${d.name}@${d.version}`;
+      const osvVulns = osvVulnMap.get(packageKey);
+      
+      if (osvVulns && osvVulns.length > 0) {
+        // Use OSV vulnerability data
+        for (const vuln of osvVulns) {
+          res.issues.push(osvToIssue(vuln, d.name));
+        }
+      } else if (osvVulnMap.size === 0) {
+        // OSV API failed completely, use fallback
+        const seeds = fallbackVulns[d.name] ?? [];
+        for (const ventry of seeds) {
+          if (semver.satisfies(d.version, ventry.range)) {
+            res.issues.push({ 
+              level: "critical", 
+              kind: "vuln", 
+              msg: ventry.msg.substring(0, 100), // Keep messages short
+              fix: `${d.name}@${ventry.fix}` 
+            });
+          }
         }
       }
+      // If OSV API worked but returned no vulnerabilities, that's good - no vulnerabilities found
 
       // Typosquatting detection (reduced false positives)
       for (const topPkg of topPackages) {
@@ -380,6 +555,7 @@ export const analyzePackages = action({
       infoCount,
       projectLicense,
       topLicenses,
+      vulnSource, // Track whether we used OSV API or fallback data
       results 
     };
   },
